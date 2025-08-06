@@ -7,3 +7,5 @@ services:
     startCommand: "./start.sh"
     branch: main
     autoDeploy: true
+    runtime: python
+    pythonVersion: 3.10.11
