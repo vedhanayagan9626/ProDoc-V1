@@ -2,6 +2,7 @@ import { showSuccess, showError, showLoading, confirmDelete } from '/static/js/n
 
 let currentPage = 1;
 const itemsPerPage = 10;
+const token = localStorage.getItem('authToken');
 
 document.addEventListener('DOMContentLoaded', function() {
     // Check if we're already on the completed list page
@@ -77,7 +78,11 @@ function renderCompletedInvoices(invoices, total = 0, totalPages = 1) {
                 <td>
                     <div class="vendor-info">
                         <strong>${vendorName}</strong>
-                        <small>${clientName}</small>
+                    </div>
+                </td>
+                <td>
+                    <div class="vendor-info">
+                        <strong>${clientName}</strong>
                     </div>
                 </td>
                 <td>${invoice.item_count || 0}</td>
@@ -185,13 +190,33 @@ async function downloadInvoice(event, invoiceNumber) {
         
         const { jsPDF } = window.jspdf;
         
-        // Fetch correction data
-        const correctionResponse = await fetch(`/api/v1/invoices/${invoiceNumber}/corrections/latest`);
-        if (!correctionResponse.ok) throw new Error(await correctionResponse.text());
+        // Debug logs
+        console.log('Original invoiceNumber:', invoiceNumber);
+        const encodedInvoiceNumber = encodeURIComponent(invoiceNumber);
+        console.log('Encoded invoiceNumber:', encodedInvoiceNumber);
+
+        // Using query parameter approach
+        const requestUrl = `/api/v1/invoices/corrections/latest?invoice_number=${encodedInvoiceNumber}`;
+        console.log('Request URL:', requestUrl);
+
+        const correctionResponse = await fetch(requestUrl, {
+            headers: { 'Authorization': `Bearer ${token}` }
+        });
+        console.log('Response status:', correctionResponse.status);
+        
+        if (!correctionResponse.ok) {
+            const errorText = await correctionResponse.text();
+            console.error('Error response:', errorText);
+            throw new Error(errorText);
+        }
+
         const correction = await correctionResponse.json();
+        console.log('Correction data:', correction);
         
         // Fetch items
-        const itemsResponse = await fetch(`/api/v1/corrections/${correction.CorrectionID}/items`);
+        const itemsResponse = await fetch(`/api/v1/corrections/${correction.CorrectionID}/items`, {
+            headers: { 'Authorization': `Bearer ${token}` }
+        });
         if (!itemsResponse.ok) throw new Error(await itemsResponse.text());
         const items = await itemsResponse.json();
 
@@ -269,7 +294,7 @@ async function downloadInvoice(event, invoiceNumber) {
             const imgHeight = (canvas.height * imgWidth) / canvas.width;
             
             pdf.addImage(imgData, 'PNG', 0, 0, imgWidth, imgHeight);
-            pdf.save(`${invoiceNumber}.pdf`);
+            pdf.save(`${invoiceNumber.replace(/\//g, '-')}.pdf`);
         });
         
         // Clean up
@@ -286,17 +311,16 @@ async function downloadInvoice(event, invoiceNumber) {
 
 // Helper function to render the invoice preview (similar to the one in invoice_process.js)
 function renderInvoicePreview(data, paperElement) {
-    // First, debug the incoming data
+    // Debug incoming data
     console.log("Invoice Data:", data.invoice_data);
     console.log("Items Data:", data.items);
     console.log("Styling Data:", data.styling);
 
-    // Handle case where data might be the root response object
-    const invData = data.invoice_data || data || {};
-    const items = data.items || (Array.isArray(data) ? data : []);
+    const invData = data.invoice_data || {};
+    const items = data.items || [];
     const styling = data.styling || {};
     
-    // Apply default styling if not provided
+    // Apply default styling with dynamic overrides
     const defaultStyles = {
         paperSize: 'a4',
         headerColor: '#333333',
@@ -309,74 +333,61 @@ function renderInvoicePreview(data, paperElement) {
     const styles = { 
         ...defaultStyles, 
         ...styling,
-        // Ensure topMargin has 'in' suffix if it's just a number
+        // Ensure topMargin has proper units
         topMargin: styling.topMargin && !styling.topMargin.includes('in') 
             ? `${styling.topMargin}in` 
             : (styling.topMargin || defaultStyles.topMargin)
     };
-    
-    // Use the values from backend directly instead of calculating
-    const subtotal = parseFloat(invData.subtotal) || 0;
-    const taxAmount = parseFloat(invData.tax_amount) || 0;
-    const total = parseFloat(invData.total) || (subtotal + taxAmount);
-    
-    console.log("Using Subtotal from backend:", subtotal);
-    console.log("Using Tax Amount from backend:", taxAmount);
-    console.log("Using Total from backend:", total);
 
     // Safely get values with defaults
     const fromAddress = invData.from_address || '';
     const toAddress = invData.to_address || '';
     const invoiceNumber = invData.invoice_number || 'INV-001';
+    const total = invData.total || '0.00';
     const invoiceDate = invData.invoice_date || new Date().toLocaleDateString();
     const supplierGst = invData.gst_number || '';
     const customerGst = invData.customer_gst || '';
     const taxDetails = invData.taxes || '';
 
+    // Calculate totals from items if not provided
+    const subtotal = invData.subtotal;
+    const taxAmount = invData.tax_amount;
+
     // Generate items HTML
     let itemsHtml = '';
     if (items.length === 0) {
-        console.warn("No items found in the invoice data");
         itemsHtml = '<tr><td colspan="8" class="no-items">No items found</td></tr>';
     } else {
         items.forEach((item, index) => {
-            console.log(`Processing item ${index}:`, item);
-            
-            // Use the properties exactly as they come from backend
-            const description = item.Description || 'Item';
-            const quantity = parseFloat(item.Quantity) || 0;
-            const rate = parseFloat(item.Rate) || 0;
-            const taxRate = parseFloat(item.Tax) || 0;
             const amount = parseFloat(item.Amount) || 0;
-            const hsn = item.HSN || '';
+            const rate = parseFloat(item.Rate) || 0;
+            const quantity = parseFloat(item.Quantity) || 1;
+            const tax = amount - (rate * quantity);
             
-            // Calculate tax amount for display
-            const taxableValue = amount / (1 + (taxRate / 100));
-            const itemTax = amount - taxableValue;
-
             itemsHtml += `
-                <tr>
-                    <td>${index + 1}</td>
-                    <td>
-                        ${description}<br>
-                        <span class="item-desc">${hsn}</span>
-                    </td>
-                    <td>
-                        ${quantity}<br>
-                        <span class="item-desc">Nos</span>
-                    </td>
-                    <td>${rate.toFixed(2)}</td>
-                    <td>0.00</td>
-                    <td>${taxRate}%</td>
-                    <td>${itemTax.toFixed(2)}</td>
-                    <td>${amount.toFixed(2)}</td>
-                </tr>
-            `;
+                        <tr>
+                            <td>${index + 1}</td>
+                            <td>
+                                ${item.description || 'Item'}<br>
+                                <span class="item-desc">${item.hsn || ''}</span>
+                            </td>
+                            <td>
+                                ${item.quantity || '1'}<br>
+                                <span class="item-desc">Nos</span>
+                            </td>
+                            <td>${(parseFloat(item.price_per_unit) || 0).toFixed(2)}</td>
+                            <td>0.00</td>
+                            <td>${item.gst || '0'}%</td>
+                            <td>${(parseFloat(item.amount) - (parseFloat(item.price_per_unit) * parseFloat(item.quantity)) || 0).toFixed(2)}</td>
+                            <td>${(parseFloat(item.amount) || 0).toFixed(2)}</td>
+                        </tr>
+                    `;
         });
     }
     
-    // Generate the invoice HTML
-    const invoiceHtml = `
+    // Generate the invoice HTML (exact match to invoice_process.js)
+    const invoiceHtml = 
+    `
         <div class="header">
             <div class="company-info">
                 <div class="company-name">${fromAddress.split('\n')[0] || 'Your Company'}</div>
@@ -387,7 +398,7 @@ function renderInvoicePreview(data, paperElement) {
                 <div class="invoice-number"># ${invoiceNumber}</div>
                 <div class="balance-due">
                     <div class="balance-label">Balance Due</div>
-                    <div class="balance-amount">₹${total.toFixed(2)}</div>
+                    <div class="balance-amount">₹${total}</div>
                 </div>
             </div>
         </div>
@@ -454,15 +465,15 @@ function renderInvoicePreview(data, paperElement) {
                 <table class="totals-table">
                     <tr>
                         <td class="total-label">Sub Total</td>
-                        <td class="total-value">₹${subtotal.toFixed(2)}</td>
+                        <td class="total-value">${subtotal.toFixed(2)}</td>
                     </tr>
                     <tr>
                         <td class="total-label">Tax Amount</td>
-                        <td class="total-value">₹${taxAmount.toFixed(2)}</td>
+                        <td class="total-value">${taxAmount.toFixed(2)}</td>
                     </tr>
                     <tr class="balance-row">
                         <td class="total-label"><b>Total</b></td>
-                        <td class="total-value"><b>₹${total.toFixed(2)}</b></td>
+                        <td class="total-value"><b>₹${(subtotal + taxAmount).toFixed(2)}</b></td>
                     </tr>
                 </table>
             </div>
@@ -476,25 +487,37 @@ function renderInvoicePreview(data, paperElement) {
         <div class="footer">
             <div class="text-center">Thank you for your business!</div>
         </div>
+    
     `;
     
     // Set the HTML content
     paperElement.innerHTML = invoiceHtml;
     
-    // Create and apply dynamic styles
+    // Create and apply styles (exact match to invoice_process.js)
     const style = document.createElement('style');
     style.textContent = `
+        /* Base styles matching the template */
         .invoice-paper {
-            font-family: ${styles.fontFamily};
-            width: ${styles.paperSize === 'a4' ? '210mm' : '216mm'};
-            min-height: ${styles.paperSize === 'a4' ? '297mm' : '279mm'};
-            margin: 0 auto;
-            padding: ${styles.topMargin};
+            font-family: ${styles.fontFamily || 'Arial, sans-serif'};
             background: white;
-            color: ${styles.textColor};
-            overflow: visible !important;
+            box-shadow: 0 0 10px rgba(0,0,0,0.1);
+            position: relative;
+            margin: 0 auto;
+            box-sizing: border-box;
+            overflow: hidden;
+            padding: ${styles.topMargin || '0.7in'};
             page-break-inside: avoid;
-            aspect-ratio: 1/1.414;
+            aspect-ratio: ${styles.paperSize === 'a4' ? '1/1.414' : '1/1.294'};
+            display: flex;
+            flex-direction: column;
+            color: ${styles.textColor || '#333333'};
+            width: ${styles.paperSize === 'a4' ? '8.27in' : '8.5in'};
+            min-height: ${styles.paperSize === 'a4' ? '11.69in' : '11in'};
+        }
+        
+        .invoice-container {
+            width: 100%;
+            height: 100%;
             display: flex;
             flex-direction: column;
         }
@@ -502,13 +525,26 @@ function renderInvoicePreview(data, paperElement) {
         .header {
             display: flex;
             justify-content: space-between;
-            margin-bottom: 20px;
-            border-bottom: 2px solid ${styles.accentColor};
+            margin-bottom: 30px;
             padding-bottom: 15px;
-            page-break-inside: avoid;
+        }
+        
+        .company-info {
+            width: 50%;
+        }
+        
+        .invoice-title {
+            width: 50%;
+            text-align: right;
         }
         
         .company-name {
+            font-weight: bold;
+            font-size: 14px;
+            margin-bottom: 5px;
+        }
+        
+        .invoice-number {
             font-weight: bold;
             font-size: 14px;
             margin-bottom: 5px;
@@ -518,11 +554,22 @@ function renderInvoicePreview(data, paperElement) {
             font-size: 24px;
             font-weight: bold;
             margin-bottom: 5px;
-            color: ${styles.headerColor};
+            color: ${styles.headerColor || '#333333'};
+        }
+        
+        .balance-due {
+            margin-top: 20px;
+        }
+        
+        .balance-label {
+            font-size: 10px;
+            font-weight: bold;
         }
         
         .balance-amount {
-            color: ${styles.accentColor};
+            font-size: 14px;
+            font-weight: bold;
+            color: ${styles.accentColor || '#3498db'};
         }
         
         .address-section {
@@ -530,15 +577,33 @@ function renderInvoicePreview(data, paperElement) {
             margin-bottom: 30px;
         }
         
+        .bill-to {
+            width: 60%;
+        }
+        
+        .invoice-details {
+            width: 40%;
+        }
+        
+        .address-label {
+            font-weight: bold;
+            margin-bottom: 5px;
+        }
+        
+        .customer-name {
+            font-weight: bold;
+        }
+        
         .items-table {
             width: 100%;
             border-collapse: collapse;
-            margin-bottom: 20px;
-            page-break-inside: avoid;
+            table-layout: fixed;
+            margin: 15px 0;
+            font-size: 0.9em;
         }
         
         .items-table th {
-            background-color: ${styles.headerColor};
+            background-color: ${styles.headerColor || '#333333'};
             color: white;
             text-align: left;
         }
@@ -549,6 +614,8 @@ function renderInvoicePreview(data, paperElement) {
         
         .items-table th, .items-table td {
             padding: 8px;
+            word-wrap: break-word;
+            overflow-wrap: break-word;
         }
         
         .item-desc {
@@ -558,13 +625,15 @@ function renderInvoicePreview(data, paperElement) {
         
         .totals-container {
             display: flex;
-            justify-content: space-between;
-            page-break-inside: avoid;
-            margin-top: 20px;
+            margin-bottom: 20px;
+        }
+        
+        .notes-section {
+            width: 50%;
         }
         
         .totals-section {
-            width: 40%;
+            width: 50%;
         }
         
         .totals-table {
@@ -583,16 +652,29 @@ function renderInvoicePreview(data, paperElement) {
         
         .total-value {
             text-align: right;
-            min-width: 80px;
+            width: 100px;
         }
         
         .balance-row {
-            border-top: 2px solid ${styles.accentColor};
+            background-color: #f5f5f5;
+        }
+        
+        .terms-section {
+            margin-bottom: 20px;
+        }
+        
+        .terms-label {
+            font-weight: bold;
+            margin-bottom: 5px;
+        }
+        
+        .signature-section {
+            margin-top: 50px;
         }
         
         .signature-line {
             width: 200px;
-            border-top: 1px solid ${styles.textColor};
+            border-bottom: 1px solid ${styles.textColor || '#333333'};
             margin-top: 30px;
         }
         
@@ -601,7 +683,7 @@ function renderInvoicePreview(data, paperElement) {
             border-top: 1px solid #ddd;
             padding-top: 10px;
             font-size: 10px;
-            color: ${styles.textColor};
+            color: ${styles.accentColor || '#3498db'};
         }
         
         .text-right {
@@ -618,12 +700,22 @@ function renderInvoicePreview(data, paperElement) {
             color: red;
             font-weight: bold;
         }
+
+        /* Dynamic elements that should use accent color */
+        .total-value b,
+        .invoice-number {
+            color: ${styles.accentColor || '#3498db'};
+        }
+
+        /* Paper size specific adjustments */
+        .invoice-paper.a5 {
+            font-size: 10px;
+            width: 5.83in;
+            min-height: 8.27in;
+        }
     `;
-    
+
     paperElement.appendChild(style);
-    
-    // Debug: Log the generated HTML
-    console.log("Generated Invoice HTML:", paperElement.innerHTML);
 }
 
 function editInvoice(event, invoiceNumber) {
@@ -655,8 +747,12 @@ async function deleteInvoice(event, invoiceNumber) {
         showLoading('Deleting invoice...');
         
         try {
-            const response = await fetch(`/api/v1/invoices/${invoiceNumber}/delete`, {
-                method: 'DELETE'
+            console.log('Original invoiceNumber:', invoiceNumber);
+            const encodedInvoiceNumber = encodeURIComponent(invoiceNumber);
+            console.log('Encoded invoiceNumber:', encodedInvoiceNumber);
+            const response = await fetch(`/api/v1/invoices/corrections/delete?invoice_number=${encodedInvoiceNumber}`, {
+                method: 'DELETE',
+                headers: { 'Authorization': `Bearer ${token}` },
             });
             
             if (!response.ok) {

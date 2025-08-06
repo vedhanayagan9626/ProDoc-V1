@@ -1,34 +1,446 @@
 // Initialize PDF.js
 pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
 
-
 // Global variables
 let lastExtractedData = null;
 let dt; // DataTable instance
 let pdfDoc = null;
 let currentPage = 1;
-let pdfScale = 1.5;
-let isPanning = false;
-let startX = 0, startY = 0;
-let panX = 0, panY = 0;
-let scale = 1;
-const minScale = 0.5;
-const maxScale = 4;
 let activeElement = null;
 let jsPDF = window.jspdf;
+let currentPreview = null; // High-quality preview instance
+const token = localStorage.getItem('authToken');
 
+
+// High-quality preview system for invoices
+class HighQualityPreview {
+    constructor() {
+        this.state = {
+            scale: 1,
+            minScale: 0.1,
+            maxScale: 5,
+            panX: 0,
+            panY: 0,
+            isDragging: false,
+            startX: 0,
+            startY: 0,
+            lastDistance: 0,
+            element: null,
+            wrapper: null,
+            originalWidth: 0,
+            originalHeight: 0
+        };
+        
+        this.cleanup = null;
+        this.devicePixelRatio = window.devicePixelRatio || 1;
+    }
+
+    // Initialize high-quality image preview
+    initImagePreview(imgElement, wrapper) {
+        return new Promise((resolve, reject) => {
+            if (!imgElement || !wrapper) {
+                reject(new Error('Invalid elements provided'));
+                return;
+            }
+
+            this.state.element = imgElement;
+            this.state.wrapper = wrapper;
+
+            // Wait for image to load completely
+            const handleImageLoad = () => {
+                // Store original dimensions
+                this.state.originalWidth = imgElement.naturalWidth;
+                this.state.originalHeight = imgElement.naturalHeight;
+
+                // Set high-quality rendering
+                imgElement.style.imageRendering = 'crisp-edges';
+                imgElement.style.imageRendering = '-webkit-optimize-contrast';
+                imgElement.style.imageRendering = 'pixelated';
+                imgElement.style.imageRendering = 'auto';
+                
+                // Reset any existing transforms
+                imgElement.style.transform = 'none';
+                imgElement.style.transformOrigin = '0 0';
+                
+                // Set initial size to natural dimensions for crisp display
+                imgElement.style.width = `${this.state.originalWidth}px`;
+                imgElement.style.height = `${this.state.originalHeight}px`;
+                imgElement.style.maxWidth = 'none';
+                imgElement.style.maxHeight = 'none';
+
+                // Calculate initial fit-to-screen scale
+                const wrapperRect = wrapper.getBoundingClientRect();
+                const scaleX = (wrapperRect.width * 0.9) / this.state.originalWidth;
+                const scaleY = (wrapperRect.height * 0.9) / this.state.originalHeight;
+                const initialScale = Math.min(scaleX, scaleY, 1);
+
+                // Set initial state
+                this.state.scale = initialScale;
+                this.centerElement(initialScale);
+                
+                // Setup event listeners
+                this.setupEventListeners();
+                
+                resolve();
+            };
+
+            if (imgElement.complete && imgElement.naturalWidth > 0) {
+                handleImageLoad();
+            } else {
+                imgElement.onload = handleImageLoad;
+                imgElement.onerror = () => reject(new Error('Failed to load image'));
+            }
+        });
+    }
+
+    // Initialize high-quality PDF preview
+    initPdfPreview(canvas, wrapper, pdfPage) {
+        return new Promise((resolve, reject) => {
+            try {
+                this.state.element = canvas;
+                this.state.wrapper = wrapper;
+
+                // Calculate high-quality viewport
+                const baseScale = 2.0; // Base scale for crisp rendering
+                const viewport = pdfPage.getViewport({ scale: baseScale });
+                
+                // Account for device pixel ratio
+                const outputScale = this.devicePixelRatio;
+                const finalScale = baseScale * outputScale;
+                
+                // Set canvas dimensions
+                canvas.width = Math.floor(viewport.width * outputScale);
+                canvas.height = Math.floor(viewport.height * outputScale);
+                
+                // Set display size (CSS pixels)
+                canvas.style.width = `${viewport.width}px`;
+                canvas.style.height = `${viewport.height}px`;
+                
+                // Store original dimensions
+                this.state.originalWidth = viewport.width;
+                this.state.originalHeight = viewport.height;
+
+                // Get context and scale for high DPI
+                const context = canvas.getContext('2d');
+                context.scale(outputScale, outputScale);
+
+                // Render at high quality
+                const renderContext = {
+                    canvasContext: context,
+                    viewport: pdfPage.getViewport({ scale: baseScale })
+                };
+
+                pdfPage.render(renderContext).promise.then(() => {
+                    // Set up crisp rendering
+                    canvas.style.imageRendering = 'crisp-edges';
+                    canvas.style.transformOrigin = '0 0';
+                    canvas.style.transform = 'none';
+
+                    // Calculate initial fit-to-screen scale
+                    const wrapperRect = wrapper.getBoundingClientRect();
+                    const scaleX = (wrapperRect.width * 0.9) / this.state.originalWidth;
+                    const scaleY = (wrapperRect.height * 0.9) / this.state.originalHeight;
+                    const initialScale = Math.min(scaleX, scaleY, 1);
+
+                    // Set initial state
+                    this.state.scale = initialScale;
+                    this.centerElement(initialScale);
+                    
+                    // Setup event listeners
+                    this.setupEventListeners();
+                    
+                    resolve();
+                }).catch(reject);
+                
+            } catch (error) {
+                reject(error);
+            }
+        });
+    }
+
+    // Center element in wrapper
+    centerElement(scale = this.state.scale) {
+        const wrapperRect = this.state.wrapper.getBoundingClientRect();
+        const elementWidth = this.state.originalWidth * scale;
+        const elementHeight = this.state.originalHeight * scale;
+        
+        this.state.panX = (wrapperRect.width - elementWidth) / 2;
+        this.state.panY = (wrapperRect.height - elementHeight) / 2;
+        
+        this.applyTransform();
+    }
+
+    // Apply transform with bounds checking
+    applyTransform() {
+        const { element, wrapper, scale, panX, panY, originalWidth, originalHeight } = this.state;
+        
+        if (!element || !wrapper) return;
+
+        const wrapperRect = wrapper.getBoundingClientRect();
+        const scaledWidth = originalWidth * scale;
+        const scaledHeight = originalHeight * scale;
+
+        // Calculate bounds
+        let newPanX = panX;
+        let newPanY = panY;
+
+        // If scaled content is larger than wrapper, allow panning within bounds
+        if (scaledWidth > wrapperRect.width) {
+            const maxPanX = 0;
+            const minPanX = wrapperRect.width - scaledWidth;
+            newPanX = Math.max(minPanX, Math.min(maxPanX, panX));
+        } else {
+            // Center if smaller than wrapper
+            newPanX = (wrapperRect.width - scaledWidth) / 2;
+        }
+
+        if (scaledHeight > wrapperRect.height) {
+            const maxPanY = 0;
+            const minPanY = wrapperRect.height - scaledHeight;
+            newPanY = Math.max(minPanY, Math.min(maxPanY, panY));
+        } else {
+            // Center if smaller than wrapper
+            newPanY = (wrapperRect.height - scaledHeight) / 2;
+        }
+
+        // Update state
+        this.state.panX = newPanX;
+        this.state.panY = newPanY;
+
+        // Apply transform using matrix for better performance
+        element.style.transform = `translate(${newPanX}px, ${newPanY}px) scale(${scale})`;
+    }
+
+    // Setup all event listeners
+    setupEventListeners() {
+        const { element } = this.state;
+        
+        // Mouse events
+        element.addEventListener('mousedown', this.handleMouseDown.bind(this));
+        document.addEventListener('mousemove', this.handleMouseMove.bind(this));
+        document.addEventListener('mouseup', this.handleMouseUp.bind(this));
+        element.addEventListener('wheel', this.handleWheel.bind(this), { passive: false });
+        element.addEventListener('dblclick', this.handleDoubleClick.bind(this));
+
+        // Touch events
+        element.addEventListener('touchstart', this.handleTouchStart.bind(this), { passive: false });
+        element.addEventListener('touchmove', this.handleTouchMove.bind(this), { passive: false });
+        element.addEventListener('touchend', this.handleTouchEnd.bind(this));
+
+        // Prevent context menu
+        element.addEventListener('contextmenu', (e) => e.preventDefault());
+
+        // Window resize
+        window.addEventListener('resize', this.handleResize.bind(this));
+
+        // Set cursor
+        element.style.cursor = 'grab';
+
+        // Store cleanup function
+        this.cleanup = () => {
+            element.removeEventListener('mousedown', this.handleMouseDown.bind(this));
+            document.removeEventListener('mousemove', this.handleMouseMove.bind(this));
+            document.removeEventListener('mouseup', this.handleMouseUp.bind(this));
+            element.removeEventListener('wheel', this.handleWheel.bind(this));
+            element.removeEventListener('dblclick', this.handleDoubleClick.bind(this));
+            element.removeEventListener('touchstart', this.handleTouchStart.bind(this));
+            element.removeEventListener('touchmove', this.handleTouchMove.bind(this));
+            element.removeEventListener('touchend', this.handleTouchEnd.bind(this));
+            element.removeEventListener('contextmenu', (e) => e.preventDefault());
+            window.removeEventListener('resize', this.handleResize.bind(this));
+        };
+    }
+
+    // Mouse event handlers
+    handleMouseDown(e) {
+        if (e.button !== 0) return; // Only left mouse button
+        e.preventDefault();
+        
+        this.state.isDragging = true;
+        this.state.startX = e.clientX - this.state.panX;
+        this.state.startY = e.clientY - this.state.panY;
+        this.state.element.style.cursor = 'grabbing';
+    }
+
+    handleMouseMove(e) {
+        if (!this.state.isDragging) return;
+        
+        this.state.panX = e.clientX - this.state.startX;
+        this.state.panY = e.clientY - this.state.startY;
+        this.applyTransform();
+    }
+
+    handleMouseUp() {
+        this.state.isDragging = false;
+        this.state.element.style.cursor = 'grab';
+    }
+
+    handleWheel(e) {
+        e.preventDefault();
+        
+        const rect = this.state.wrapper.getBoundingClientRect();
+        const mouseX = e.clientX - rect.left;
+        const mouseY = e.clientY - rect.top;
+        
+        // Calculate zoom
+        const zoomIntensity = 0.1;
+        const delta = e.deltaY > 0 ? -zoomIntensity : zoomIntensity;
+        const newScale = Math.min(
+            this.state.maxScale, 
+            Math.max(this.state.minScale, this.state.scale + delta)
+        );
+        
+        // Zoom toward mouse position
+        const scaleRatio = newScale / this.state.scale;
+        this.state.panX = mouseX - (mouseX - this.state.panX) * scaleRatio;
+        this.state.panY = mouseY - (mouseY - this.state.panY) * scaleRatio;
+        this.state.scale = newScale;
+        
+        this.applyTransform();
+    }
+
+    handleDoubleClick() {
+        // Fit to screen
+        const wrapperRect = this.state.wrapper.getBoundingClientRect();
+        const scaleX = (wrapperRect.width * 0.9) / this.state.originalWidth;
+        const scaleY = (wrapperRect.height * 0.9) / this.state.originalHeight;
+        const fitScale = Math.min(scaleX, scaleY, 1);
+        
+        this.state.scale = fitScale;
+        this.centerElement(fitScale);
+    }
+
+    // Touch event handlers
+    handleTouchStart(e) {
+        e.preventDefault();
+        
+        if (e.touches.length === 1) {
+            // Single touch - start dragging
+            this.state.isDragging = true;
+            this.state.startX = e.touches[0].clientX - this.state.panX;
+            this.state.startY = e.touches[0].clientY - this.state.panY;
+        } else if (e.touches.length === 2) {
+            // Two touches - prepare for pinch zoom
+            this.state.isDragging = false;
+            const touch1 = e.touches[0];
+            const touch2 = e.touches[1];
+            this.state.lastDistance = Math.hypot(
+                touch2.clientX - touch1.clientX,
+                touch2.clientY - touch1.clientY
+            );
+        }
+    }
+
+    handleTouchMove(e) {
+        e.preventDefault();
+        
+        if (e.touches.length === 1 && this.state.isDragging) {
+            // Single touch drag
+            this.state.panX = e.touches[0].clientX - this.state.startX;
+            this.state.panY = e.touches[0].clientY - this.state.startY;
+            this.applyTransform();
+        } else if (e.touches.length === 2) {
+            // Pinch zoom
+            const touch1 = e.touches[0];
+            const touch2 = e.touches[1];
+            const currentDistance = Math.hypot(
+                touch2.clientX - touch1.clientX,
+                touch2.clientY - touch1.clientY
+            );
+            
+            if (this.state.lastDistance > 0) {
+                const scaleChange = currentDistance / this.state.lastDistance;
+                const newScale = Math.min(
+                    this.state.maxScale,
+                    Math.max(this.state.minScale, this.state.scale * scaleChange)
+                );
+                
+                // Calculate center between touches
+                const rect = this.state.wrapper.getBoundingClientRect();
+                const centerX = (touch1.clientX + touch2.clientX) / 2 - rect.left;
+                const centerY = (touch1.clientY + touch2.clientY) / 2 - rect.top;
+                
+                // Zoom toward center
+                const scaleRatio = newScale / this.state.scale;
+                this.state.panX = centerX - (centerX - this.state.panX) * scaleRatio;
+                this.state.panY = centerY - (centerY - this.state.panY) * scaleRatio;
+                this.state.scale = newScale;
+                
+                this.applyTransform();
+            }
+            
+            this.state.lastDistance = currentDistance;
+        }
+    }
+
+    handleTouchEnd() {
+        this.state.isDragging = false;
+        this.state.lastDistance = 0;
+    }
+
+    handleResize() {
+        // Recalculate and maintain current view on resize
+        setTimeout(() => {
+            this.applyTransform();
+        }, 100);
+    }
+
+    // Public methods
+    zoomIn() {
+        const newScale = Math.min(this.state.maxScale, this.state.scale + 0.2);
+        this.zoomToCenter(newScale);
+    }
+
+    zoomOut() {
+        const newScale = Math.max(this.state.minScale, this.state.scale - 0.2);
+        this.zoomToCenter(newScale);
+    }
+
+    zoomToCenter(scale) {
+        const rect = this.state.wrapper.getBoundingClientRect();
+        const centerX = rect.width / 2;
+        const centerY = rect.height / 2;
+        
+        const scaleRatio = scale / this.state.scale;
+        this.state.panX = centerX - (centerX - this.state.panX) * scaleRatio;
+        this.state.panY = centerY - (centerY - this.state.panY) * scaleRatio;
+        this.state.scale = scale;
+        
+        this.applyTransform();
+    }
+
+    fitToScreen() {
+        const wrapperRect = this.state.wrapper.getBoundingClientRect();
+        const scaleX = (wrapperRect.width * 0.9) / this.state.originalWidth;
+        const scaleY = (wrapperRect.height * 0.9) / this.state.originalHeight;
+        const fitScale = Math.min(scaleX, scaleY, 1);
+        
+        this.state.scale = fitScale;
+        this.centerElement(fitScale);
+    }
+
+    actualSize() {
+        this.state.scale = 1;
+        this.centerElement(1);
+    }
+
+    destroy() {
+        if (this.cleanup) {
+            this.cleanup();
+        }
+    }
+}
 
 // Make essential functions globally available
 window.displayFilePreview = displayFilePreview;
 window.processFile = processFile;
-window.resetTransform = resetTransform;
 window.showToast = showToast;
 
 // Main initialization
 $(document).ready(function() {
     initializeApplication();
     setupPreviewControls();
-    initializeItemHandlers()
+    initializeItemHandlers();
 });
 
 function initializeApplication() {
@@ -60,7 +472,7 @@ function initializeApplication() {
     $('#saveBtn').on('click', handleSaveInvoice);
     $('#addItemBtn').on('click', handleAddItem);
     
-    // Initialize download buttons - Add these lines
+    // Initialize download buttons
     $('#downloadPdfBtn').on('click', function(e) {
         e.preventDefault();
         downloadAsPDF();
@@ -71,34 +483,15 @@ function initializeApplication() {
         downloadAsImage();
     });
 
-    // Initialize pan/zoom
-    attachPanZoom(document.getElementById('previewImg'), false);
-    attachPanZoom(document.getElementById('pdfViewer'), true);
-
-    // Initialize pan/zoom after elements are loaded
-    setTimeout(() => {
-            const previewImg = document.getElementById('previewImg');
-            const pdfViewer = document.getElementById('pdfViewer');
-            
-            if (previewImg) {
-                attachPanZoom(previewImg, false);
-                resetTransform(previewImg);
-            }
-            
-            if (pdfViewer) {
-                attachPanZoom(pdfViewer, true);
-            }
-            
-            // Add touch event support for mobile devices
-            setupTouchEvents();
-        }, 500);
+    // Window resize handler
+    window.addEventListener('resize', function() {
+        if (currentPreview) {
+            currentPreview.handleResize();
+        }
+    });
 
     // Initialize preview controls
     setupPreviewControls();
-    
-    // Window resize handler
-    $(window).on('resize', resizePreviewArea);
-    resizePreviewArea();
     
     // Initialize item handlers
     initializeItemHandlers();
@@ -107,107 +500,100 @@ function initializeApplication() {
     setupPreviewListeners();
 }
 
-// Touch event support
-function setupTouchEvents() {
-    const previewWrapper = document.getElementById('previewWrapper');
-    if (!previewWrapper) return;
-    
-    let touchStartX = 0;
-    let touchStartY = 0;
-    let initialPanX = 0;
-    let initialPanY = 0;
-    
-    previewWrapper.addEventListener('touchstart', function(e) {
-        if (e.touches.length !== 1) return;
-        e.preventDefault();
-        
-        const activeEl = document.getElementById('previewImg').style.display !== 'none' ? 
-            document.getElementById('previewImg') : 
-            document.getElementById('pdfViewer');
-            
-        if (!activeEl) return;
-        
-        touchStartX = e.touches[0].clientX;
-        touchStartY = e.touches[0].clientY;
-        initialPanX = panX;
-        initialPanY = panY;
-        activeEl.style.cursor = 'grabbing';
-    });
-    
-    previewWrapper.addEventListener('touchmove', function(e) {
-        if (e.touches.length !== 1) return;
-        e.preventDefault();
-        
-        const activeEl = document.getElementById('previewImg').style.display !== 'none' ? 
-            document.getElementById('previewImg') : 
-            document.getElementById('pdfViewer');
-            
-        if (!activeEl) return;
-        
-        panX = initialPanX + (e.touches[0].clientX - touchStartX);
-        panY = initialPanY + (e.touches[0].clientY - touchStartY);
-        
-        if (activeEl.id === 'pdfViewer') {
-            renderPdfPage(currentPage, pdfScale);
-        } else {
-            applyTransform(activeEl);
+// Enhanced PDF preview function with high quality
+async function fetchPDFPreview(filename) {
+    const pdfViewer = document.getElementById('pdfViewer');
+    const wrapper = document.getElementById('previewWrapper');
+
+    try {
+        // Clean up previous preview
+        if (currentPreview) {
+            currentPreview.destroy();
         }
-    });
-    
-    previewWrapper.addEventListener('touchend', function() {
-        const activeEl = document.getElementById('previewImg').style.display !== 'none' ? 
-            document.getElementById('previewImg') : 
-            document.getElementById('pdfViewer');
-            
-        if (activeEl) {
-            activeEl.style.cursor = 'grab';
+
+        const response = await fetch(`/api/v1/get-file?filename=${encodeURIComponent(filename)}`);
+        if (!response.ok) throw new Error('Failed to load PDF');
+        
+        const blob = await response.blob();
+        const objectUrl = URL.createObjectURL(blob);
+        
+        const pdf = await pdfjsLib.getDocument(objectUrl).promise;
+        pdfDoc = pdf;
+        
+        const page = await pdf.getPage(1);
+        
+        pdfViewer.style.display = 'block';
+        
+        // Initialize high-quality preview
+        currentPreview = new HighQualityPreview();
+        await currentPreview.initPdfPreview(pdfViewer, wrapper, page);
+        
+        showToast("PDF loaded successfully");
+        
+    } catch (error) {
+        console.error("PDF preview error:", error);
+        showToast("Failed to load PDF preview", false);
+    }
+}
+
+// Enhanced image preview function with high quality
+async function fetchImagePreview(filename) {
+    const previewImg = document.getElementById('previewImg');
+    const wrapper = document.getElementById('previewWrapper');
+
+    try {
+        // Clean up previous preview
+        if (currentPreview) {
+            currentPreview.destroy();
         }
-    });
+
+        const response = await fetch(`/api/v1/get-file?filename=${encodeURIComponent(filename)}`);
+        if (!response.ok) throw new Error('Failed to load image');
+        
+        const blob = await response.blob();
+        const objectUrl = URL.createObjectURL(blob);
+        
+        previewImg.src = objectUrl;
+        previewImg.style.display = 'block';
+        
+        // Initialize high-quality preview
+        currentPreview = new HighQualityPreview();
+        await currentPreview.initImagePreview(previewImg, wrapper);
+        
+        showToast("Image loaded successfully");
+        
+    } catch (error) {
+        console.error("Image preview error:", error);
+        showToast("Failed to load image preview", false);
+    }
+}
+
+// Display file preview with high quality support
+function displayFilePreview(filename) {
+    if (!filename) {
+        showToast("No file specified for preview", false);
+        return;
+    }
     
-    // Pinch zoom for touch devices
-    let initialDistance = 0;
-    let initialScale = 1;
+    const fileType = filename.split('.').pop().toLowerCase();
+    const previewImg = document.getElementById('previewImg');
+    const pdfViewer = document.getElementById('pdfViewer');
+
+    // Hide both initially
+    previewImg.style.display = 'none';
+    pdfViewer.style.display = 'none';
     
-    previewWrapper.addEventListener('touchstart', function(e) {
-        if (e.touches.length === 2) {
-            e.preventDefault();
-            initialDistance = Math.hypot(
-                e.touches[0].clientX - e.touches[1].clientX,
-                e.touches[0].clientY - e.touches[1].clientY
-            );
-            initialScale = scale;
-        }
-    });
-    
-    previewWrapper.addEventListener('touchmove', function(e) {
-        if (e.touches.length === 2) {
-            e.preventDefault();
-            
-            const activeEl = document.getElementById('previewImg').style.display !== 'none' ? 
-                document.getElementById('previewImg') : 
-                document.getElementById('pdfViewer');
-                
-            if (!activeEl) return;
-            
-            const currentDistance = Math.hypot(
-                e.touches[0].clientX - e.touches[1].clientX,
-                e.touches[0].clientY - e.touches[1].clientY
-            );
-            
-            const newScale = Math.min(maxScale, Math.max(minScale, initialScale * (currentDistance / initialDistance)));
-            
-            if (newScale !== scale) {
-                scale = newScale;
-                
-                if (activeEl.id === 'pdfViewer') {
-                    pdfScale = scale * 1.5;
-                    renderPdfPage(currentPage, pdfScale);
-                } else {
-                    applyTransform(activeEl);
-                }
-            }
-        }
-    });
+    // Clear previous transforms
+    previewImg.style.transform = 'none';
+    pdfViewer.style.transform = 'none';
+
+    if (fileType === 'pdf') {
+        fetchPDFPreview(filename);
+    } else if (['jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp', 'tiff'].includes(fileType)) {
+        fetchImagePreview(filename);
+    } else {
+        showToast("Unsupported file type for preview", false);
+    }
 }
 
 function handleUrlParameters() {
@@ -241,6 +627,7 @@ function processFile(filename, mode) {
 
     fetch('/api/v1/upload-invoice', {
         method: 'POST',
+        headers: { 'Authorization': `Bearer ${token}` },
         body: formData
     })
     .then(response => {
@@ -262,240 +649,6 @@ function processFile(filename, mode) {
         hideGlobalSpinner();
         $('#uploadForm').find('button, input, select').prop('disabled', false);
     });
-}
-
-// Display file preview with proper CORS handling
-function displayFilePreview(filename) {
-    if (!filename) {
-        showToast("No file specified for preview", false);
-        return;
-    }
-
-    const fileType = filename.split('.').pop().toLowerCase();
-    const previewImg = $('#previewImg');
-    const pdfViewer = $('#pdfViewer');
-    
-    // Hide both initially
-    previewImg.hide();
-    pdfViewer.hide();
-
-    if (fileType === 'pdf') {
-        fetchPDFPreview(filename);
-    } else if (['jpg', 'jpeg', 'png', 'gif'].includes(fileType)) {
-        fetchImagePreview(filename);
-    } else {
-        showToast("Unsupported file type for preview", false);
-    }
-}
-
-function fetchPDFPreview(filename) {
-    const pdfViewer = document.getElementById('pdfViewer');
-    
-    fetch(`/api/v1/get-file?filename=${encodeURIComponent(filename)}`)
-        .then(response => {
-            if (!response.ok) throw new Error('Failed to load PDF');
-            return response.blob();
-        })
-        .then(blob => {
-            const objectUrl = URL.createObjectURL(blob);
-            return pdfjsLib.getDocument(objectUrl).promise;
-        })
-        .then(pdf => {
-            pdfDoc = pdf;
-            return pdf.getPage(1);
-        })
-        .then(page => {
-            const viewport = page.getViewport({ scale: 1.5 });
-            pdfViewer.height = viewport.height;
-            pdfViewer.width = viewport.width;
-            const context = pdfViewer.getContext("2d");
-            
-            return page.render({
-                canvasContext: context,
-                viewport: viewport
-            });
-        })
-        .then(() => {
-            pdfViewer.style.display = 'block';
-        })
-        .catch(error => {
-            console.error("PDF preview error:", error);
-            showToast("Failed to load PDF preview", false);
-        });
-}
-
-function fetchImagePreview(filename) {
-    const previewImg = document.getElementById('previewImg');
-    const wrapper = document.getElementById('previewWrapper');
-    
-    fetch(`/api/v1/get-file?filename=${encodeURIComponent(filename)}`)
-        .then(response => {
-            if (!response.ok) throw new Error('Failed to load image');
-            return response.blob();
-        })
-        .then(blob => {
-            const objectUrl = URL.createObjectURL(blob);
-            previewImg.src = objectUrl;
-            previewImg.style.display = 'block';
-            
-            previewImg.onload = function() {
-                URL.revokeObjectURL(objectUrl); // Clean up memory
-                
-                // Center the image initially
-                const wrapperWidth = wrapper.clientWidth;
-                const wrapperHeight = wrapper.clientHeight;
-                const imgWidth = this.naturalWidth;
-                const imgHeight = this.naturalHeight;
-                
-                // Calculate initial scale to fit
-                const scaleX = wrapperWidth / imgWidth;
-                const scaleY = wrapperHeight / imgHeight;
-                scale = Math.min(scaleX, scaleY, 1);
-                
-                // Center the image
-                panX = (wrapperWidth - imgWidth * scale) / 2;
-                panY = (wrapperHeight - imgHeight * scale) / 2;
-                
-                applyTransform(previewImg);
-            };
-            
-            previewImg.onerror = function() {
-                URL.revokeObjectURL(objectUrl);
-                throw new Error('Image failed to load');
-            };
-        })
-        .catch(error => {
-            console.error("Image preview error:", error);
-            showToast("Failed to load image preview", false);
-        });
-}
-
-
-// PDF rendering with pan/zoom support
-function renderPdfPage(pageNum, scaleVal) {
-    if (!pdfDoc) return;
-    
-    pdfDoc.getPage(pageNum).then(page => {
-        const pdfViewer = document.getElementById('pdfViewer');
-        const viewport = page.getViewport({ scale: scaleVal });
-        
-        // Adjust canvas size
-        pdfViewer.height = viewport.height;
-        pdfViewer.width = viewport.width;
-        
-        const context = pdfViewer.getContext("2d");
-        
-        // Clear previous render
-        context.clearRect(0, 0, pdfViewer.width, pdfViewer.height);
-        
-        // Create temporary canvas for rendering
-        const tempCanvas = document.createElement('canvas');
-        tempCanvas.width = pdfViewer.width;
-        tempCanvas.height = pdfViewer.height;
-        const tempContext = tempCanvas.getContext('2d');
-        
-        // Render page to temporary canvas
-        page.render({
-            canvasContext: tempContext,
-            viewport: viewport
-        }).promise.then(() => {
-            // Apply pan/zoom transform to the main canvas
-            context.save();
-            context.translate(panX, panY);
-            context.scale(scale, scale);
-            context.drawImage(tempCanvas, 0, 0);
-            context.restore();
-            
-            pdfViewer.style.display = 'block';
-        });
-    }).catch(error => {
-        console.error("PDF render error:", error);
-        showToast("Failed to render PDF page", false);
-    });
-}
-
-// Pan/Zoom Functions
-function attachPanZoom(el, isPDF = false) {
-    if (!el) return;
-
-    // Mouse down handler
-    el.addEventListener('mousedown', function(e) {
-        if (el.style.display === 'none') return;
-        e.preventDefault();
-        isPanning = true;
-        activeElement = el;
-        startX = e.clientX - panX;
-        startY = e.clientY - panY;
-        el.style.cursor = 'grabbing';
-    });
-
-    // Mouse move handler
-    document.addEventListener('mousemove', function(e) {
-        if (!isPanning) return;
-        e.preventDefault();
-        
-        panX = e.clientX - startX;
-        panY = e.clientY - startY;
-        
-        if (isPDF) {
-            // For PDF, we need to re-render at the new position
-            renderPdfPage(currentPage, pdfScale);
-        } else {
-            applyTransform(el);
-        }
-    });
-
-    // Mouse up handler
-    document.addEventListener('mouseup', function() {
-        isPanning = false;
-        if (activeElement) {
-            activeElement.style.cursor = 'grab';
-        }
-    });
-
-    // Wheel handler for zooming
-    el.addEventListener('wheel', function(e) {
-        if (el.style.display === 'none') return;
-        e.preventDefault();
-        
-        // Get mouse position relative to element
-        const rect = el.getBoundingClientRect();
-        const mouseX = e.clientX - rect.left;
-        const mouseY = e.clientY - rect.top;
-        
-        // Calculate zoom direction and amount
-        const delta = e.deltaY > 0 ? -0.1 : 0.1;
-        const newScale = Math.min(maxScale, Math.max(minScale, scale + delta));
-        
-        if (newScale !== scale) {
-            // Adjust pan to zoom toward mouse position
-            panX = mouseX - (mouseX - panX) * (newScale / scale);
-            panY = mouseY - (mouseY - panY) * (newScale / scale);
-            
-            scale = newScale;
-            
-            if (isPDF) {
-                pdfScale = scale * 1.5;
-                renderPdfPage(currentPage, pdfScale);
-            } else {
-                applyTransform(el);
-            }
-        }
-    });
-}
-
-// Apply transform to element
-function applyTransform(el) {
-    el.style.transform = `translate(${panX}px, ${panY}px) scale(${scale})`;
-}
-
-// Reset transform
-function resetTransform(element) {
-    if (!element) return;
-    panX = 0;
-    panY = 0;
-    scale = 1;
-    element.style.transform = 'translate(0px, 0px) scale(1)';
 }
 
 // Event Handlers
@@ -911,6 +1064,119 @@ function setupPreviewListeners() {
     });
 }
 
+function formatDate(inputDate) {
+    if (!inputDate) return ''; // Return empty string for null/undefined
+    
+    // Try parsing as ISO date first (e.g., "2023-11-15")
+    if (/^\d{4}-\d{2}-\d{2}$/.test(inputDate)) {
+        return inputDate;
+    }
+    
+    // Common month misspellings mapping
+    const monthCorrections = {
+        'Nowember': 'November',
+        'Janurary': 'January',
+        'Feburary': 'February',
+        'Febrary': 'February',
+        'Febraury': 'February',
+        'Febuary': 'February',
+        'Marc': 'March',
+        'Apri': 'April',
+        'Jun': 'June',
+        'Jul': 'July',
+        'Auguest': 'August',
+        'Septmber': 'September',
+        'Septmeber': 'September',
+        'Octber': 'October',
+        'Octobor': 'October',
+        'Decemeber': 'December',
+        'Decemebr': 'December'
+    };
+    
+    // Try to correct common misspellings
+    let correctedDate = inputDate;
+    for (const [wrong, correct] of Object.entries(monthCorrections)) {
+        if (correctedDate.includes(wrong)) {
+            correctedDate = correctedDate.replace(wrong, correct);
+            break;
+        }
+    }
+    
+    // Try parsing with Date object
+    try {
+        const dateObj = new Date(correctedDate);
+        
+        // Check if date is valid
+        if (!isNaN(dateObj.getTime())) {
+            return dateObj.toISOString().split('T')[0]; // YYYY-MM-DD format
+        }
+    } catch (e) {
+        console.warn("Date parsing error:", e);
+    }
+    
+    // Try parsing common formats manually
+    const formats = [
+        // DD/MM/YYYY or MM/DD/YYYY
+        /(\d{1,2})[\/-](\d{1,2})[\/-](\d{2,4})/,
+        // Month DD, YYYY (e.g., November 15, 2023)
+        /([A-Za-z]+)\s+(\d{1,2}),?\s+(\d{4})/,
+        // DD Month YYYY (e.g., 15 November 2023)
+        /(\d{1,2})\s+([A-Za-z]+)\s+(\d{4})/
+    ];
+    
+    for (const format of formats) {
+        const match = correctedDate.match(format);
+        if (match) {
+            try {
+                let day, month, year;
+                
+                if (match[1].length > 2) {
+                    // Month is first (e.g., November 15, 2023)
+                    month = match[1];
+                    day = match[2];
+                    year = match[3];
+                } else if (match[2].length > 2) {
+                    // Month is second (e.g., 15 November 2023)
+                    day = match[1];
+                    month = match[2];
+                    year = match[3];
+                } else {
+                    // Numeric format (e.g., 11/15/2023)
+                    // This is ambiguous - could be MM/DD or DD/MM
+                    // We'll assume DD/MM/YYYY for international format
+                    day = match[1];
+                    month = match[2];
+                    year = match[3];
+                }
+                
+                // Convert month name to number if needed
+                if (isNaN(month)) {
+                    const monthIndex = new Date(`${month} 1, 2000`).getMonth();
+                    if (!isNaN(monthIndex)) {
+                        month = monthIndex + 1;
+                    } else {
+                        continue; // Try next format
+                    }
+                }
+                
+                // Pad with zeros if needed
+                month = month.toString().padStart(2, '0');
+                day = day.toString().padStart(2, '0');
+                
+                // Create ISO date string
+                return `${year}-${month}-${day}`;
+            } catch (e) {
+                console.warn("Date format parsing error:", e);
+                continue;
+            }
+        }
+    }
+    
+    // If all parsing attempts fail, return the original input (or empty string)
+    console.warn(`Could not parse date: ${inputDate}`);
+    return inputDate.trim() || ''; // Return original or empty if input was empty
+}
+
 function handleSaveInvoice() {
     showDatatableSpinner();
     const updatedInvoice = {
@@ -923,52 +1189,81 @@ function handleSaveInvoice() {
         textColor: $('#textColor').val(),
         accentColor: $('#accentColor').val(),
         topMargin: $('#topMargin').val()
-        //if any styles enabled in invoice editor add them here 
     };
 
-    // Collect basic invoice data (same as before)
+    // Collect basic invoice data
     $('#invoiceForm input, #invoiceForm textarea').each(function() {
         const field = $(this).data('field');
         if (field) {
             updatedInvoice.invoice_data[field] = $(this).val();
         }
     });
+
+    const rawDate = $('#invoiceDate').val();
+    try {
+        updatedInvoice.invoice_data.invoice_date = formatDate(rawDate);
+    } catch (e) {
+        console.error("Date formatting failed:", e);
+        updatedInvoice.invoice_data.invoice_date = rawDate; // Fallback to raw value
+    }
     
-    // Add calculated fields
     updatedInvoice.invoice_data.subtotal = $('#subtotal').val();
     updatedInvoice.invoice_data.tax_amount = $('#taxAmount').val();
-        // Add to your correction data
     updatedInvoice.styling = styling;
 
     // Collect items data
     $('#itemsTableBody tr').each(function() {
         const row = $(this);
         const item = {};
-        
         row.find('input').each(function() {
             const field = $(this).data('field');
             if (field) {
                 item[field] = $(this).val();
             }
         });
-        
         if (Object.keys(item).length > 0) {
             updatedInvoice.items.push(item);
         }
+        updatedInvoice.items.forEach(item => {
+            item.quantity = parseFloat(item.quantity).toFixed(2);
+            item.price_per_unit = parseFloat(item.price_per_unit).toFixed(2);
+            item.gst = parseFloat(item.gst).toFixed(2);
+            item.amount = parseFloat(item.amount).toFixed(2);
+            item.original_item_id = item.item_id || null;
+        });
     });
+
+    // Hide previous error
+    $('#errorField').addClass('d-none').text('');
+
     console.log("Data being sent to backend:", updatedInvoice);
-    // Call the new correction endpoint
+
     $.ajax({
         url: '/api/v1/invoices/save-correction',
         type: 'POST',
+        headers: { 'Authorization': `Bearer ${token}` },
         contentType: 'application/json',
         data: JSON.stringify(updatedInvoice),
         success: function(response) {
             showToast("Invoice corrections saved successfully.");
             $('#saveBtn').html('<i class="fas fa-check-circle"></i> Saved').prop('disabled', true);
+            $('#errorField').addClass('d-none').text('');
         },
-        error: function() {
-            showToast("Failed to save invoice corrections.", false);
+        error: function(xhr) {
+            let errorMsg = "Failed to save invoice corrections.";
+            if (xhr.responseJSON && xhr.responseJSON.detail) {
+                errorMsg = xhr.responseJSON.detail;
+            } else if (xhr.responseText) {
+                try {
+                    const resp = JSON.parse(xhr.responseText);
+                    if (resp.detail) errorMsg = resp.detail;
+                } catch (e) {}
+            }
+            $('#errorField').removeClass('d-none').text(errorMsg);
+            setTimeout(() => {
+                $('#errorField').addClass('d-none').text('');
+            }, 3000);
+            showToast(errorMsg, false);
         },
         complete: hideDatatableSpinner
     });
@@ -1243,112 +1538,41 @@ function downloadAsPDF() {
 }
 
 
-// Download as Image
-// function downloadAsImage() {
-//     showToast("Generating image...");
-    
-//     const paper = document.getElementById('invoice-paper');
-//     const container = document.getElementById('invoice-preview-container');
-    
-//     // Store original styles
-//     const originalStyles = {
-//         transform: paper.style.transform,
-//         transformOrigin: paper.style.transformOrigin,
-//         width: paper.style.width,
-//         height: paper.style.height,
-//         overflow: paper.style.overflow
-//     };
-    
-//     // Remove any scaling/transformations
-//     paper.style.transform = 'none';
-//     paper.style.transformOrigin = 'top left';
-//     paper.style.overflow = 'visible';
-    
-//     // Get natural dimensions based on paper size
-//     const paperSize = $('#paperSizeSelect').val().toLowerCase();
-//     let width, height;
-    
-//     switch(paperSize) {
-//         case 'a4':
-//             width = 8.27 * 96; // Convert inches to pixels (96 DPI)
-//             height = 11.69 * 96;
-//             break;
-//         case 'letter':
-//             width = 8.5 * 96;
-//             height = 11 * 96;
-//             break;
-//         case 'a5':
-//             width = 5.83 * 96;
-//             height = 8.27 * 96;
-//             break;
-//         default:
-//             width = 8.27 * 96;
-//             height = 11.69 * 96;
-//     }
-    
-//     // Temporarily set exact dimensions
-//     paper.style.width = `${width}px`;
-//     paper.style.height = `${height}px`;
-    
-//     // Use html2canvas with proper settings
-//     html2canvas(paper, {
-//         scale: 1, // No additional scaling
-//         logging: true,
-//         useCORS: true,
-//         allowTaint: true,
-//         scrollX: 0,
-//         scrollY: 0,
-//         width: width,
-//         height: height,
-//         windowWidth: width,
-//         windowHeight: height
-//     }).then(canvas => {
-//         // Restore original styles
-//         Object.keys(originalStyles).forEach(key => {
-//             paper.style[key] = originalStyles[key];
-//         });
-        
-//         // Create download link
-//         const link = document.createElement('a');
-//         const invoiceNumber = $('#invoiceNumber').val() || 'invoice';
-//         link.download = `${invoiceNumber}.png`;
-//         link.href = canvas.toDataURL('image/png');
-        
-//         // Trigger download
-//         document.body.appendChild(link);
-//         link.click();
-//         document.body.removeChild(link);
-        
-//         showToast("Image downloaded successfully");
-//     }).catch(err => {
-//         console.error("Image generation error:", err);
-//         showToast("Failed to generate image", false);
-        
-//         // Restore original styles if error occurs
-//         Object.keys(originalStyles).forEach(key => {
-//             paper.style[key] = originalStyles[key];
-//         });
-//     });
-// }
-
 function downloadAsImage() {
     showToast("Generating image...");
     
-    // Create a temporary container
+    // Create a temporary container with white background
     const tempContainer = document.createElement('div');
     tempContainer.style.position = 'absolute';
     tempContainer.style.left = '-9999px';
     tempContainer.style.top = '0';
     tempContainer.style.width = '100%';
     tempContainer.style.height = '100%';
+    tempContainer.style.backgroundColor = 'white';
     document.body.appendChild(tempContainer);
     
-    // Clone the invoice paper
+    // Clone the invoice paper and force white background everywhere
     const paper = document.getElementById('invoice-paper');
     const clone = paper.cloneNode(true);
+    
+    // Reset all styles that might affect background
     clone.style.transform = 'none';
     clone.style.width = '';
     clone.style.height = '';
+    clone.style.padding = '';
+    clone.style.margin = '';
+    clone.style.backgroundColor = 'white';
+    clone.style.background = 'white';
+    
+    // Apply white background to all child elements
+    $(clone).find('*').each(function() {
+        $(this).css({
+            'background-color': 'white',
+            'background': 'white',
+            'color': '#333' // Ensure text remains dark
+        });
+    });
+    
     tempContainer.appendChild(clone);
     
     // Get paper size
@@ -1357,7 +1581,7 @@ function downloadAsImage() {
     
     switch(paperSize) {
         case 'a4':
-            width = 8.27 * 96;
+            width = 8.27 * 96; // Convert inches to pixels (96 DPI)
             height = 11.69 * 96;
             break;
         case 'letter':
@@ -1377,30 +1601,48 @@ function downloadAsImage() {
     clone.style.width = `${width}px`;
     clone.style.height = `${height}px`;
     
-    // Capture the clone
+    // Capture the clone with proper settings
     html2canvas(clone, {
-        scale: 1,
+        scale: 2, // Higher scale for better quality
         width: width,
         height: height,
         windowWidth: width,
-        windowHeight: height
+        windowHeight: height,
+        backgroundColor: 'white',
+        logging: true, // Helpful for debugging
+        useCORS: true,
+        allowTaint: true
     }).then(canvas => {
-        // Clean up
-        document.body.removeChild(tempContainer);
+        // Create a final canvas to ensure pure white background
+        const finalCanvas = document.createElement('canvas');
+        finalCanvas.width = canvas.width;
+        finalCanvas.height = canvas.height;
+        const ctx = finalCanvas.getContext('2d');
+        
+        // Fill with white background first
+        ctx.fillStyle = 'white';
+        ctx.fillRect(0, 0, finalCanvas.width, finalCanvas.height);
+        
+        // Draw the captured content
+        ctx.drawImage(canvas, 0, 0);
         
         // Download
         const link = document.createElement('a');
-        link.download = `${$('#invoiceNumber').val() || 'invoice'}.png`;
-        link.href = canvas.toDataURL('image/png');
+        const invoiceNumber = $('#invoiceNumber').val() || 'invoice';
+        link.download = `${invoiceNumber}.png`;
+        link.href = finalCanvas.toDataURL('image/png');
         link.click();
         
+        // Clean up
+        document.body.removeChild(tempContainer);
         showToast("Image downloaded successfully");
     }).catch(err => {
-        document.body.removeChild(tempContainer);
         console.error("Image generation error:", err);
+        document.body.removeChild(tempContainer);
         showToast("Failed to generate image", false);
     });
 }
+
 function showGlobalSpinner() {
     // Create spinner overlay if it doesn't exist
     if (!$('#globalSpinnerOverlay').length) {
