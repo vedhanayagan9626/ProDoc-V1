@@ -1,5 +1,9 @@
 import os
 from pathlib import Path
+from dotenv import load_dotenv
+load_dotenv()
+
+
 
 ROOT_DIR = Path(__file__).resolve().parent.parent  # Points to INVOICE_Extractor/
 TEMPLATES_DIR = ROOT_DIR / "templates"

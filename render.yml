@@ -1,7 +1,7 @@
 # This file is used to configure the Render service for the Invoice Parser API.
 services:
   - type: web
-    name: Invoice-Parser-APP-V1
+    name: ProDoc-V1
     env: python
     buildCommand: "pip install -r requirements.txt"
     startCommand: "./start.sh"
