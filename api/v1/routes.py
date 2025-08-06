@@ -18,7 +18,6 @@ from datetime import datetime
 import decimal, json
 from decimal import Decimal, InvalidOperation
 from dateutil import parser
-import logger
 # from main import app
 # import vendor_parsers.ocr_parser.surekha_goldocr as surekha_goldocr
 # import vendor_parsers.plumber_parser.satruntech_pdf as satruntech_pdf

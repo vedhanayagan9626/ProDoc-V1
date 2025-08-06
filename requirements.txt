@@ -21,5 +21,4 @@ passlib==1.7.4
 pyasn1==0.6.1
 python-jose==3.5.0
 rsa==4.9.1
-logger==1.4
 ocrmypdf==16.10.4
